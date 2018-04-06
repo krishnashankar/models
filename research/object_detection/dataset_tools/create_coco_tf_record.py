@@ -35,6 +35,7 @@ import json
 import os
 import numpy as np
 import PIL.Image
+import math
 
 from pycocotools import mask
 import tensorflow as tf
@@ -44,7 +45,7 @@ from object_detection.utils import label_map_util
 
 
 flags = tf.app.flags
-tf.flags.DEFINE_boolean('include_masks', False,
+tf.flags.DEFINE_boolean('include_masks', True,
                         'Whether to include instance segmentations masks '
                         '(PNG encoded) in the result. default: False.')
 tf.flags.DEFINE_string('train_image_dir', '',
@@ -59,7 +60,13 @@ tf.flags.DEFINE_string('val_annotations_file', '',
                        'Validation annotations JSON file.')
 tf.flags.DEFINE_string('testdev_annotations_file', '',
                        'Test-dev annotations JSON file.')
+tf.flags.DEFINE_string('dataset_name', 'mscoco', 'Name of the dataset.')
 tf.flags.DEFINE_string('output_dir', '/tmp/', 'Output data directory.')
+tf.flags.DEFINE_integer('train_num_shards', 1, 'number of shards for training set')
+tf.flags.DEFINE_integer('val_num_shards', 1, 'number of shards for validation set')
+tf.flags.DEFINE_integer('test_num_shards', 1, 'number of shards for test set')
+
+
 
 FLAGS = flags.FLAGS
 
@@ -183,12 +190,14 @@ def create_tf_example(image,
   if include_masks:
     feature_dict['image/object/mask'] = (
         dataset_util.bytes_list_feature(encoded_mask_png))
+    feature_dict['image/object/mask/format'] = (
+        dataset_util.bytes_list_feature('png'.encode('utf8')))
   example = tf.train.Example(features=tf.train.Features(feature=feature_dict))
   return key, example, num_annotations_skipped
 
 
 def _create_tf_record_from_coco_annotations(
-    annotations_file, image_dir, output_path, include_masks):
+    annotations_file, image_dir, num_shards, output_path, split_name, dataset_name, include_masks):
   """Loads COCO annotation json files and converts to tf.Record format.
 
   Args:
@@ -198,12 +207,17 @@ def _create_tf_record_from_coco_annotations(
     include_masks: Whether to include instance segmentations masks
       (PNG encoded) in the result. default: False.
   """
+  
   with tf.gfile.GFile(annotations_file, 'r') as fid:
     groundtruth_data = json.load(fid)
     images = groundtruth_data['images']
     category_index = label_map_util.create_category_index(
         groundtruth_data['categories'])
-
+    cur_shard = 0
+    record_path = get_dataset_filename(output_path, dataset_name, split_name, cur_shard,num_shards)
+    writer = tf.python_io.TFRecordWriter(record_path)
+    num_files = len(groundtruth_data['images'])
+    num_files_per_shard = math.ceil(float(num_files)/float(num_shards))
     annotations_index = {}
     if 'annotations' in groundtruth_data:
       tf.logging.info(
@@ -221,23 +235,36 @@ def _create_tf_record_from_coco_annotations(
         annotations_index[image_id] = []
     tf.logging.info('%d images are missing annotations.',
                     missing_annotation_count)
-
-    tf.logging.info('writing to output path: %s', output_path)
-    writer = tf.python_io.TFRecordWriter(output_path)
+   
+    
     total_num_annotations_skipped = 0
     for idx, image in enumerate(images):
       if idx % 100 == 0:
         tf.logging.info('On image %d of %d', idx, len(images))
+      if idx > (cur_shard+1)*num_files_per_shard:
+        cur_shard=cur_shard+1
+        record_path = get_dataset_filename(output_path, dataset_name, split_name, cur_shard,num_shards)
+        writer = tf.python_io.TFRecordWriter(record_path)
+        
+      if idx % 100 == 0:
+        tf.logging.info('writing to output path: %s', record_path)
+      
       annotations_list = annotations_index[image['id']]
       _, tf_example, num_annotations_skipped = create_tf_example(
           image, annotations_list, image_dir, category_index, include_masks)
       total_num_annotations_skipped += num_annotations_skipped
       writer.write(tf_example.SerializeToString())
+      
     writer.close()
     tf.logging.info('Finished writing, skipped %d annotations.',
                     total_num_annotations_skipped)
 
 
+def get_dataset_filename(dataset_dir, dataset_name, split_name, shard_id, num_shards):
+      output_filename = '%s_%s_%05d-of-%05d.tfrecord' % (
+                dataset_name, split_name, shard_id, num_shards)
+      return os.path.join(dataset_dir, output_filename)
+    
 def main(_):
   assert FLAGS.train_image_dir, '`train_image_dir` missing.'
   assert FLAGS.val_image_dir, '`val_image_dir` missing.'
@@ -248,25 +275,31 @@ def main(_):
 
   if not tf.gfile.IsDirectory(FLAGS.output_dir):
     tf.gfile.MakeDirs(FLAGS.output_dir)
-  train_output_path = os.path.join(FLAGS.output_dir, 'coco_train.record')
-  val_output_path = os.path.join(FLAGS.output_dir, 'coco_val.record')
-  testdev_output_path = os.path.join(FLAGS.output_dir, 'coco_testdev.record')
 
   _create_tf_record_from_coco_annotations(
       FLAGS.train_annotations_file,
       FLAGS.train_image_dir,
-      train_output_path,
-      FLAGS.include_masks)
+      FLAGS.train_num_shards,
+      FLAGS.output_dir,
+      FLAGS.dataset_name,
+      'train',
+      include_masks=True)
   _create_tf_record_from_coco_annotations(
       FLAGS.val_annotations_file,
       FLAGS.val_image_dir,
-      val_output_path,
-      FLAGS.include_masks)
+      FLAGS.val_num_shards,
+      FLAGS.output_dir,
+      FLAGS.dataset_name,
+      'val',
+      include_masks=True)
   _create_tf_record_from_coco_annotations(
       FLAGS.testdev_annotations_file,
       FLAGS.test_image_dir,
-      testdev_output_path,
-      FLAGS.include_masks)
+      FLAGS.test_num_shards,
+      FLAGS.output_dir,
+      FLAGS.dataset_name,
+      'test',
+      include_masks=True)
 
 
 if __name__ == '__main__':
